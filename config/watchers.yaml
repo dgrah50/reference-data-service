@@ -1,0 +1,40 @@
+exchanges:
+  - exchange: Binance
+    fields:
+      - pair_count
+      - pair_symbols
+      - spot_pair_count
+      - perpetual_pair_count
+      - futures_pair_count
+
+  - exchange: OKX
+    fields:
+      - pair_count
+      - spot_pair_count
+      - perpetual_pair_count
+      - futures_pair_count
+
+  - exchange: Bybit
+    fields:
+      - pair_count
+      - pair_symbols
+      - spot_pair_count
+      - perpetual_pair_count
+      - futures_pair_count
+
+  - exchange: Bitget
+    fields:
+      - pair_count
+      - spot_pair_count
+      - perpetual_pair_count
+      - futures_pair_count
+
+  - exchange: Coinbase
+    fields:
+      - pair_count
+      - spot_pair_count
+
+  - exchange: CoinbaseInternational
+    fields:
+      - pair_count
+      - perpetual_pair_count

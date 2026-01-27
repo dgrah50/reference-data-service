@@ -1,0 +1,44 @@
+[project]
+name = "reference-data-service"
+version = "0.1.0"
+description = "Reference data provider for crypto exchanges"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mypy>=1.15.0",
+    "ruff>=0.9.6",
+    "aiohttp>=3.9.3",
+    "fastapi>=0.109.2",
+    "uvicorn>=0.27.1",
+    "deepdiff>=6.7.1",
+    "pydantic>=2.6.1",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.5",
+    "httpx>=0.26.0",
+    "pytest-mock>=3.14.0",
+    "websockets>=14.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.1.1",
+    "isort>=5.13.2",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
