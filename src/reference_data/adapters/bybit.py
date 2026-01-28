@@ -43,6 +43,7 @@ class BybitExchangeAdapter(BaseExchangeAdapter):
         self.state = ExchangeState()
         self._last_ping_time = 0.0
         self._all_pairs: Dict[InstrumentType, List[TradingPair]] = {}
+        self._known_symbols: Dict[InstrumentType, set] = {}
         self._circuit_breaker = CircuitBreaker(
             name=f"{ExchangeEnum.BYBIT.value}",
             config=CircuitBreakerConfig(
@@ -325,18 +326,186 @@ class BybitExchangeAdapter(BaseExchangeAdapter):
 
     async def _listen(self) -> None:
         """
-        Listen to the Bybit WebSocket endpoint.
+        Listen to Bybit ticker streams to detect new symbols.
         First fetches initial snapshot via REST for all instrument types,
-        then polls every 300 seconds to refresh the data.
-        Applies rate limiting and retry logic with exponential backoff.
+        then subscribes to tickers topic to detect new listings.
+        When a new symbol is detected, triggers REST refresh.
         """
         # Fetch initial snapshot for all instrument types
         await self._fetch_initial_snapshot()
 
-        # Poll every 300 seconds
+        # Initialize known symbols from initial fetch
+        for instrument_type, pairs in self._all_pairs.items():
+            self._known_symbols[instrument_type] = {p.symbol for p in pairs}
+
+        # Start ticker listeners for all supported instrument types
+        supported = self.get_supported_instruments()
+        tasks = [
+            asyncio.create_task(self._listen_ticker_stream(instrument_type))
+            for instrument_type in supported
+        ]
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _listen_ticker_stream(self, instrument_type: InstrumentType) -> None:
+        """
+        Listen to Bybit tickers stream for an instrument type.
+        Detects new symbols and triggers REST refresh when found.
+
+        Args:
+            instrument_type: The instrument type to monitor
+        """
+        endpoint = self.config.get_endpoint(instrument_type, self.is_testnet)
+        if not endpoint or not endpoint.ws_url:
+            logging.warning(
+                f"Bybit {instrument_type.value} WebSocket URL not configured, falling back to polling"
+            )
+            await self._poll_instrument(instrument_type)
+            return
+
+        retry_delay = 1
+
+        async def send_ping(ws: aiohttp.ClientWebSocketResponse) -> None:
+            """Send periodic pings to keep the connection alive."""
+            while True:
+                try:
+                    await asyncio.sleep(self.config.ping_interval)
+                    await ws.send_json({"op": "ping"})
+                    self._last_ping_time = time.time()
+                except Exception as e:
+                    logging.error("Error sending Bybit ping: %s", e)
+                    break
+
+        while True:
+            try:
+                await self.ws_rate_limiter.acquire()
+                async with self.session.ws_connect(endpoint.ws_url) as ws:
+                    logging.info(
+                        "Connected to Bybit %s ticker stream at %s",
+                        instrument_type.value,
+                        endpoint.ws_url,
+                    )
+                    retry_delay = 1
+                    self._last_ping_time = time.time()
+
+                    # Subscribe to all tickers for this category
+                    # Bybit uses "tickers.*" pattern to subscribe to all symbols
+                    subscribe_msg = {
+                        "op": "subscribe",
+                        "args": ["tickers.*"],
+                    }
+                    await ws.send_json(subscribe_msg)
+
+                    # Start ping task
+                    ping_task = asyncio.create_task(send_ping(ws))
+
+                    try:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = msg.json()
+
+                                # Handle pong response
+                                if data.get("op") == "pong":
+                                    continue
+
+                                # Handle subscription confirmation
+                                if data.get("op") == "subscribe":
+                                    if data.get("success"):
+                                        logging.info(
+                                            "Subscribed to Bybit %s tickers", instrument_type.value
+                                        )
+                                    continue
+
+                                # Handle ticker data - Bybit sends topic: "tickers.BTCUSDT"
+                                topic = data.get("topic", "")
+                                if topic.startswith("tickers."):
+                                    await self._process_bybit_ticker(instrument_type, data)
+
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                logging.error(
+                                    "Bybit %s ticker stream error: %s",
+                                    instrument_type.value,
+                                    ws.exception(),
+                                )
+                                break
+                    finally:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
+
+            except Exception as e:
+                logging.error(
+                    "Bybit %s ticker stream exception: %s", instrument_type.value, e
+                )
+
+            logging.info(
+                "Bybit %s ticker stream disconnected. Reconnecting in %s seconds...",
+                instrument_type.value,
+                retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+
+    async def _process_bybit_ticker(
+        self, instrument_type: InstrumentType, data: Dict[str, Any]
+    ) -> None:
+        """
+        Process Bybit ticker data and detect new symbols.
+
+        Args:
+            instrument_type: The instrument type being processed
+            data: Ticker message from WebSocket
+        """
+        known = self._known_symbols.get(instrument_type, set())
+
+        # Extract symbol from topic "tickers.BTCUSDT" or from data
+        topic = data.get("topic", "")
+        symbol = None
+        if topic.startswith("tickers."):
+            symbol = topic.replace("tickers.", "")
+        elif "data" in data:
+            symbol = data["data"].get("symbol")
+
+        if symbol and symbol not in known:
+            logging.info(
+                "Detected new %s symbol on Bybit: %s", instrument_type.value, symbol
+            )
+            # Trigger REST refresh to get full instrument details
+            endpoint = self.config.get_endpoint(instrument_type, self.is_testnet)
+            if endpoint:
+                try:
+                    await self._fetch_instrument_data(instrument_type, endpoint.rest_url)
+                    # Update known symbols
+                    if instrument_type in self._all_pairs:
+                        self._known_symbols[instrument_type] = {
+                            p.symbol for p in self._all_pairs[instrument_type]
+                        }
+                    # Emit updated state
+                    if updated_state := self.state.update_state({}, self._to_standard):
+                        self._bus.publish(updated_state)
+                except Exception as e:
+                    logging.error(
+                        f"Failed to refresh {instrument_type.value} after new symbol detection: {e}"
+                    )
+
+    async def _poll_instrument(self, instrument_type: InstrumentType) -> None:
+        """
+        Fallback polling for a single instrument type when WebSocket unavailable.
+
+        Args:
+            instrument_type: The instrument type to poll
+        """
         while True:
             await asyncio.sleep(300)
             try:
-                await self._fetch_initial_snapshot()
+                endpoint = self.config.get_endpoint(instrument_type, self.is_testnet)
+                if endpoint:
+                    await self._fetch_instrument_data(instrument_type, endpoint.rest_url)
+                    if self._all_pairs:
+                        if updated_state := self.state.update_state({}, self._to_standard):
+                            self._bus.publish(updated_state)
             except Exception as e:
-                logging.error(f"Bybit periodic update failed: {e}")
+                logging.error(f"Bybit {instrument_type.value} poll failed: {e}")

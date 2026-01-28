@@ -5,7 +5,6 @@ Binance exchange adapter implementation.
 import asyncio
 import logging
 import time
-import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -43,8 +42,8 @@ class BinanceExchangeAdapter(BaseExchangeAdapter):
         )
         self.state = ExchangeState()
         self._last_ping_time = 0.0
-        self._last_pong_time = 0.0
         self._all_pairs: Dict[InstrumentType, List[TradingPair]] = {}
+        self._known_symbols: Dict[InstrumentType, set] = {}
         self._circuit_breaker = CircuitBreaker(
             name=f"{ExchangeEnum.BINANCE.value}",
             config=CircuitBreakerConfig(
@@ -233,24 +232,6 @@ class BinanceExchangeAdapter(BaseExchangeAdapter):
             exchange=ExchangeEnum.BINANCE, timestamp=server_time, trading_pairs=all_pairs
         )
 
-    async def _handle_ping_pong(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        """
-        Handle WebSocket ping/pong to maintain connection.
-
-        Args:
-            ws: WebSocket connection
-        """
-        now = time.time()
-
-        if now - self._last_ping_time >= self.config.ping_interval:
-            ping_id = str(uuid.uuid4())
-            ping_msg = {"id": ping_id, "method": "ping"}
-            await ws.send_json(ping_msg)
-            self._last_ping_time = now
-            logging.debug("Sent ping to Binance WebSocket")
-
-        if now - self._last_pong_time >= self.config.ping_timeout:
-            raise Exception("Binance WebSocket ping timeout")
 
     async def _fetch_initial_snapshot(self) -> None:
         """
@@ -334,18 +315,152 @@ class BinanceExchangeAdapter(BaseExchangeAdapter):
 
     async def _listen(self) -> None:
         """
-        Listen to the Binance WebSocket endpoint.
+        Listen to Binance ticker streams to detect new symbols.
         First fetches initial snapshot via REST for all instrument types,
-        then polls every 300 seconds to refresh the data.
-        Applies rate limiting and retry logic with exponential backoff.
+        then subscribes to !miniTicker@arr streams to detect new listings.
+        When a new symbol is detected, triggers REST refresh.
         """
         # Fetch initial snapshot for all instrument types
         await self._fetch_initial_snapshot()
 
-        # Poll every 300 seconds
+        # Initialize known symbols from initial fetch
+        for instrument_type, pairs in self._all_pairs.items():
+            self._known_symbols[instrument_type] = {p.symbol for p in pairs}
+
+        # Start ticker listeners for all supported instrument types
+        supported = self.get_supported_instruments()
+        tasks = [
+            asyncio.create_task(self._listen_ticker_stream(instrument_type))
+            for instrument_type in supported
+        ]
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _listen_ticker_stream(self, instrument_type: InstrumentType) -> None:
+        """
+        Listen to Binance !miniTicker@arr stream for an instrument type.
+        Detects new symbols and triggers REST refresh when found.
+
+        Args:
+            instrument_type: The instrument type to monitor
+        """
+        endpoint = self.config.get_endpoint(instrument_type, self.is_testnet)
+        if not endpoint or not endpoint.ws_url:
+            logging.warning(
+                f"Binance {instrument_type.value} WebSocket URL not configured, falling back to polling"
+            )
+            await self._poll_instrument(instrument_type)
+            return
+
+        # Construct the stream URL with !miniTicker@arr
+        stream_url = f"{endpoint.ws_url}/!miniTicker@arr"
+        retry_delay = 1
+
+        while True:
+            try:
+                await self.ws_rate_limiter.acquire()
+                async with self.session.ws_connect(
+                    stream_url, max_msg_size=1024 * 1024 * 16
+                ) as ws:
+                    logging.info(
+                        "Connected to Binance %s ticker stream at %s",
+                        instrument_type.value,
+                        stream_url,
+                    )
+                    retry_delay = 1
+                    self._last_ping_time = time.time()
+
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = msg.json()
+
+                            # !miniTicker@arr returns an array of ticker objects
+                            if isinstance(data, list):
+                                await self._process_ticker_data(instrument_type, data)
+
+                        elif msg.type == aiohttp.WSMsgType.PING:
+                            await ws.pong(msg.data)
+
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            logging.error(
+                                "Binance %s ticker stream error: %s",
+                                instrument_type.value,
+                                ws.exception(),
+                            )
+                            break
+
+            except Exception as e:
+                logging.error(
+                    "Binance %s ticker stream exception: %s", instrument_type.value, e
+                )
+
+            logging.info(
+                "Binance %s ticker stream disconnected. Reconnecting in %s seconds...",
+                instrument_type.value,
+                retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+
+    async def _process_ticker_data(
+        self, instrument_type: InstrumentType, tickers: List[Dict[str, Any]]
+    ) -> None:
+        """
+        Process ticker data and detect new symbols.
+
+        Args:
+            instrument_type: The instrument type being processed
+            tickers: List of ticker objects from the stream
+        """
+        known = self._known_symbols.get(instrument_type, set())
+        new_symbols = set()
+
+        for ticker in tickers:
+            symbol = ticker.get("s")  # 's' is symbol in miniTicker format
+            if symbol and symbol not in known:
+                new_symbols.add(symbol)
+
+        if new_symbols:
+            logging.info(
+                "Detected %d new %s symbols on Binance: %s",
+                len(new_symbols),
+                instrument_type.value,
+                list(new_symbols)[:5],  # Log first 5
+            )
+            # Trigger REST refresh to get full instrument details
+            endpoint = self.config.get_endpoint(instrument_type, self.is_testnet)
+            if endpoint:
+                try:
+                    await self._fetch_instrument_data(instrument_type, endpoint.rest_url)
+                    # Update known symbols
+                    if instrument_type in self._all_pairs:
+                        self._known_symbols[instrument_type] = {
+                            p.symbol for p in self._all_pairs[instrument_type]
+                        }
+                    # Emit updated state
+                    if updated_state := self.state.update_state({}, self._to_standard):
+                        self._bus.publish(updated_state)
+                except Exception as e:
+                    logging.error(
+                        f"Failed to refresh {instrument_type.value} after new symbol detection: {e}"
+                    )
+
+    async def _poll_instrument(self, instrument_type: InstrumentType) -> None:
+        """
+        Fallback polling for a single instrument type when WebSocket unavailable.
+
+        Args:
+            instrument_type: The instrument type to poll
+        """
         while True:
             await asyncio.sleep(300)
             try:
-                await self._fetch_initial_snapshot()
+                endpoint = self.config.get_endpoint(instrument_type, self.is_testnet)
+                if endpoint:
+                    await self._fetch_instrument_data(instrument_type, endpoint.rest_url)
+                    if self._all_pairs:
+                        if updated_state := self.state.update_state({}, self._to_standard):
+                            self._bus.publish(updated_state)
             except Exception as e:
-                logging.error(f"Binance periodic update failed: {e}")
+                logging.error(f"Binance {instrument_type.value} poll failed: {e}")

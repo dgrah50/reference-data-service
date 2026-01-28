@@ -37,7 +37,12 @@ class CoinbaseExchangeAdapter(BaseExchangeAdapter):
             max_calls=self.config.rest_rate_limit, period=self.config.rest_rate_period
         )
         self.state = ExchangeState()
+        self.ws_rate_limiter = RateLimiter(
+            max_calls=self.config.ws_rate_limit, period=self.config.ws_rate_period
+        )
+        self._last_ping_time = 0.0
         self._all_pairs: Dict[InstrumentType, List[TradingPair]] = {}
+        self._known_symbols: Dict[InstrumentType, set] = {}
         self._circuit_breaker = CircuitBreaker(
             name=f"{ExchangeEnum.COINBASE.value}",
             config=CircuitBreakerConfig(
@@ -205,18 +210,138 @@ class CoinbaseExchangeAdapter(BaseExchangeAdapter):
 
     async def _listen(self) -> None:
         """
-        Listen to the Coinbase REST endpoint (no WebSocket support).
-        First fetches initial snapshot via REST,
-        then polls every 300 seconds to refresh the data.
-        Applies rate limiting and retry logic with exponential backoff.
+        Listen to Coinbase status channel to detect new products.
+        First fetches initial snapshot via REST, then subscribes to
+        status channel which provides product list updates.
         """
         # Fetch initial snapshot
         await self._fetch_initial_snapshot()
 
-        # Poll every 300 seconds
+        # Initialize known symbols from initial fetch
+        for instrument_type, pairs in self._all_pairs.items():
+            self._known_symbols[instrument_type] = {p.symbol for p in pairs}
+
+        # Get WebSocket URL
+        endpoint = self.config.get_endpoint(InstrumentType.SPOT, self.is_testnet)
+        if not endpoint or not endpoint.ws_url:
+            logging.warning("Coinbase WebSocket URL not configured, falling back to polling")
+            await self._poll_instrument(InstrumentType.SPOT)
+            return
+
+        await self._listen_status_channel(endpoint.ws_url)
+
+    async def _listen_status_channel(self, ws_url: str) -> None:
+        """
+        Listen to Coinbase status channel for product updates.
+        The status channel provides the full list of products with each message.
+
+        Args:
+            ws_url: WebSocket URL to connect to
+        """
+        retry_delay = 1
+
+        while True:
+            try:
+                await self.ws_rate_limiter.acquire()
+                async with self.session.ws_connect(ws_url) as ws:
+                    logging.info("Connected to Coinbase status channel at %s", ws_url)
+                    retry_delay = 1
+                    self._last_ping_time = time.time()
+
+                    # Subscribe to status channel
+                    subscribe_msg = {
+                        "type": "subscribe",
+                        "channels": ["status"],
+                    }
+                    await ws.send_json(subscribe_msg)
+
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = msg.json()
+                            msg_type = data.get("type")
+
+                            # Handle subscription confirmation
+                            if msg_type == "subscriptions":
+                                logging.info("Subscribed to Coinbase status channel")
+                                continue
+
+                            # Handle error
+                            if msg_type == "error":
+                                logging.error("Coinbase WebSocket error: %s", data.get("message"))
+                                continue
+
+                            # Handle status message - contains products list
+                            if msg_type == "status":
+                                await self._process_status_message(data)
+
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            logging.error("Coinbase status channel error: %s", ws.exception())
+                            break
+
+            except Exception as e:
+                logging.error("Coinbase status channel exception: %s", e)
+
+            logging.info(
+                "Coinbase status channel disconnected. Reconnecting in %s seconds...",
+                retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+
+    async def _process_status_message(self, data: Dict[str, Any]) -> None:
+        """
+        Process Coinbase status message and detect new products.
+
+        Args:
+            data: Status message from WebSocket
+        """
+        known = self._known_symbols.get(InstrumentType.SPOT, set())
+        products = data.get("products", [])
+
+        # Check for new symbols
+        new_symbols = set()
+        for product in products:
+            product_id = product.get("id")
+            if product_id and product_id not in known:
+                new_symbols.add(product_id)
+
+        if new_symbols:
+            logging.info(
+                "Detected %d new SPOT products on Coinbase: %s",
+                len(new_symbols),
+                list(new_symbols)[:5],
+            )
+            # Trigger REST refresh to get full product details
+            endpoint = self.config.get_endpoint(InstrumentType.SPOT, self.is_testnet)
+            if endpoint:
+                try:
+                    await self._fetch_instrument_data(InstrumentType.SPOT, endpoint.rest_url)
+                    # Update known symbols
+                    if InstrumentType.SPOT in self._all_pairs:
+                        self._known_symbols[InstrumentType.SPOT] = {
+                            p.symbol for p in self._all_pairs[InstrumentType.SPOT]
+                        }
+                    # Emit updated state
+                    if updated_state := self.state.update_state({}, self._to_standard):
+                        self._bus.publish(updated_state)
+                except Exception as e:
+                    logging.error(f"Failed to refresh SPOT after new product detection: {e}")
+
+    async def _poll_instrument(self, instrument_type: InstrumentType) -> None:
+        """
+        Fallback polling for a single instrument type when WebSocket unavailable.
+
+        Args:
+            instrument_type: The instrument type to poll
+        """
         while True:
             await asyncio.sleep(300)
             try:
-                await self._fetch_initial_snapshot()
+                endpoint = self.config.get_endpoint(instrument_type, self.is_testnet)
+                if endpoint:
+                    await self._fetch_instrument_data(instrument_type, endpoint.rest_url)
+                    if self._all_pairs:
+                        if updated_state := self.state.update_state({}, self._to_standard):
+                            self._bus.publish(updated_state)
             except Exception as e:
-                logging.error(f"Coinbase periodic update failed: {e}")
+                logging.error(f"Coinbase {instrument_type.value} poll failed: {e}")

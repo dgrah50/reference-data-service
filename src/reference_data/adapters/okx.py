@@ -264,17 +264,171 @@ class OKXExchangeAdapter(BaseExchangeAdapter):
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 60)
 
+    def _get_okx_inst_type(self, instrument_type: InstrumentType) -> str:
+        """
+        Map InstrumentType to OKX instType string.
+
+        Args:
+            instrument_type: Internal instrument type
+
+        Returns:
+            OKX instType string (SPOT, SWAP, FUTURES)
+        """
+        mapping = {
+            InstrumentType.SPOT: "SPOT",
+            InstrumentType.PERPETUAL: "SWAP",
+            InstrumentType.FUTURES: "FUTURES",
+        }
+        return mapping.get(instrument_type, "SPOT")
+
+    def _convert_diff(
+        self, instrument_type: InstrumentType, diff_data: Dict[str, Any]
+    ) -> List[TradingPair]:
+        """
+        Convert OKX diff update to TradingPair list.
+
+        Args:
+            instrument_type: The type of instrument being updated
+            diff_data: Diff data from OKX WebSocket
+
+        Returns:
+            List of updated TradingPair instances
+        """
+        if instrument_type == InstrumentType.SPOT:
+            return self._convert_spot(diff_data)
+        elif instrument_type == InstrumentType.PERPETUAL:
+            return self._convert_perpetual(diff_data)
+        elif instrument_type == InstrumentType.FUTURES:
+            return self._convert_futures(diff_data)
+        return []
+
     async def _listen(self) -> None:
         """
-        Listen to the OKX WebSocket endpoint.
-        First fetches initial snapshot via REST for all instrument types,
-        then polls every 300 seconds to refresh the data.
-        Applies rate limiting and retry logic with exponential backoff.
+        Listen to the OKX WebSocket endpoint for all instrument types.
+        First fetches initial snapshot via REST, then subscribes to
+        WebSocket instruments channel for real-time updates.
+        OKX supports subscribing to multiple instTypes on a single connection.
         """
         # Fetch initial snapshot for all instrument types
         await self._fetch_initial_snapshot()
 
-        # Poll every 300 seconds
+        # Get WebSocket URL (same for all instrument types on OKX)
+        endpoint = self.config.get_endpoint(InstrumentType.SPOT, self.is_testnet)
+        if not endpoint or not endpoint.ws_url:
+            logging.warning("OKX WebSocket URL not configured, falling back to polling")
+            await self._poll_all_instruments()
+            return
+
+        # Build subscription message for all supported instrument types
+        supported = self.get_supported_instruments()
+        subscribe_args = [
+            {"channel": "instruments", "instType": self._get_okx_inst_type(inst)}
+            for inst in supported
+        ]
+        subscribe_message = {"op": "subscribe", "args": subscribe_args}
+
+        retry_delay = 1
+
+        async def send_ping(ws: aiohttp.ClientWebSocketResponse) -> None:
+            """Send periodic pings to keep the connection alive."""
+            while True:
+                try:
+                    await asyncio.sleep(self.config.ping_interval)
+                    await ws.send_str("ping")
+                    self._last_ping_time = time.time()
+                    logging.debug("Sent ping to OKX WebSocket")
+                except Exception as e:
+                    logging.error("Error sending OKX ping: %s", e)
+                    break
+
+        while True:
+            try:
+                await self.ws_rate_limiter.acquire()
+                async with self.session.ws_connect(endpoint.ws_url) as ws:
+                    logging.info("Connected to OKX websocket at %s", endpoint.ws_url)
+                    await ws.send_json(subscribe_message)
+                    retry_delay = 1  # Reset delay on successful connection
+                    self._last_ping_time = time.time()
+
+                    # Create ping task to keep OKX connection alive
+                    ping_task = asyncio.create_task(send_ping(ws))
+
+                    try:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                # Handle pong response (OKX returns "pong" as string)
+                                if msg.data == "pong":
+                                    continue
+
+                                data: Dict[str, Any] = msg.json()
+
+                                # Handle pong as JSON (some versions)
+                                if data.get("event") == "pong":
+                                    continue
+
+                                # Handle subscription confirmation
+                                if data.get("event") == "subscribe":
+                                    channel = data.get("arg", {}).get("channel", "")
+                                    inst_type = data.get("arg", {}).get("instType", "")
+                                    logging.info(
+                                        "OKX WebSocket subscribed to %s/%s", channel, inst_type
+                                    )
+                                    continue
+
+                                # Handle error events
+                                if data.get("event") == "error":
+                                    logging.error("OKX WebSocket error: %s", data.get("msg"))
+                                    continue
+
+                                # Handle instrument data updates
+                                if "data" in data and data.get("arg", {}).get("channel") == "instruments":
+                                    okx_inst_type = data.get("arg", {}).get("instType", "")
+
+                                    # Map OKX instType back to InstrumentType
+                                    inst_type_map = {
+                                        "SPOT": InstrumentType.SPOT,
+                                        "SWAP": InstrumentType.PERPETUAL,
+                                        "FUTURES": InstrumentType.FUTURES,
+                                    }
+                                    instrument_type = inst_type_map.get(okx_inst_type)
+
+                                    if instrument_type:
+                                        pairs = self._convert_diff(instrument_type, data)
+                                        if pairs:
+                                            self._all_pairs[instrument_type] = pairs
+                                            if updated_state := self.state.update_state(
+                                                {}, self._to_standard
+                                            ):
+                                                self._bus.publish(updated_state)
+                                                logging.debug(
+                                                    "OKX %s instruments updated: %d pairs",
+                                                    okx_inst_type,
+                                                    len(pairs),
+                                                )
+
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                logging.error("OKX WebSocket error: %s", ws.exception())
+                                break
+                    finally:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
+
+            except Exception as e:
+                logging.error("OKX websocket connection exception: %s", e)
+
+            logging.info(
+                "OKX websocket connection lost. Reconnecting in %s seconds...", retry_delay
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+
+    async def _poll_all_instruments(self) -> None:
+        """
+        Fallback polling for all instruments when WebSocket is unavailable.
+        """
         while True:
             await asyncio.sleep(300)
             try:

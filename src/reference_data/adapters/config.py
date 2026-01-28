@@ -86,7 +86,7 @@ BINANCE_CONFIG = ExchangeConfig(
     mainnet=InstrumentEndpoints(
         spot=EndpointConfig(
             rest_url="https://api.binance.com/api/v3/exchangeInfo",
-            ws_url="wss://ws-api.binance.com:443/ws-api/v3",
+            ws_url="wss://stream.binance.com:9443/ws",
         ),
         perpetual=EndpointConfig(
             rest_url="https://fapi.binance.com/fapi/v1/exchangeInfo",
@@ -100,7 +100,7 @@ BINANCE_CONFIG = ExchangeConfig(
     testnet=InstrumentEndpoints(
         spot=EndpointConfig(
             rest_url="https://testnet.binance.vision/api/v3/exchangeInfo",
-            ws_url="wss://testnet.binance.vision/ws-api/v3",
+            ws_url="wss://testnet.binance.vision/ws",
         ),
         perpetual=EndpointConfig(
             rest_url="https://testnet.binancefuture.com/fapi/v1/exchangeInfo",
@@ -234,7 +234,7 @@ COINBASE_CONFIG = ExchangeConfig(
     mainnet=InstrumentEndpoints(
         spot=EndpointConfig(
             rest_url="https://api.exchange.coinbase.com/products",
-            ws_url="",
+            ws_url="wss://ws-feed.exchange.coinbase.com",
         ),
         perpetual=None,
         futures=None,
@@ -242,7 +242,7 @@ COINBASE_CONFIG = ExchangeConfig(
     testnet=InstrumentEndpoints(
         spot=EndpointConfig(
             rest_url="https://api-public.sandbox.exchange.coinbase.com/products",
-            ws_url="",
+            ws_url="wss://ws-feed-public.sandbox.exchange.coinbase.com",
         ),
         perpetual=None,
         futures=None,

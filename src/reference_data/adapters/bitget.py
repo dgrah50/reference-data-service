@@ -40,7 +40,9 @@ class BitgetExchangeAdapter(BaseExchangeAdapter):
             max_calls=self.config.ws_rate_limit, period=self.config.ws_rate_period
         )
         self.state = ExchangeState()
+        self._last_ping_time = 0.0
         self._all_pairs: Dict[InstrumentType, List[TradingPair]] = {}
+        self._known_symbols: Dict[InstrumentType, set] = {}
         self._circuit_breaker = CircuitBreaker(
             name=f"{ExchangeEnum.BITGET.value}",
             config=CircuitBreakerConfig(
@@ -369,20 +371,211 @@ class BitgetExchangeAdapter(BaseExchangeAdapter):
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, 60)
 
+    def _get_bitget_inst_type(self, instrument_type: InstrumentType) -> str:
+        """
+        Map InstrumentType to Bitget instType string.
+
+        Args:
+            instrument_type: Internal instrument type
+
+        Returns:
+            Bitget instType string
+        """
+        mapping = {
+            InstrumentType.SPOT: "SPOT",
+            InstrumentType.PERPETUAL: "USDT-FUTURES",
+            InstrumentType.FUTURES: "COIN-FUTURES",
+        }
+        return mapping.get(instrument_type, "SPOT")
+
     async def _listen(self) -> None:
         """
-        Listen to the Bitget WebSocket endpoint.
+        Listen to Bitget ticker streams to detect new symbols.
         First fetches initial snapshot via REST for all instrument types,
-        then polls every 300 seconds to refresh the data.
-        Applies rate limiting and retry logic with exponential backoff.
+        then subscribes to ticker channel to detect new listings.
+        When a new symbol is detected, triggers REST refresh.
         """
         # Fetch initial snapshot for all instrument types
         await self._fetch_initial_snapshot()
 
-        # Poll every 300 seconds
+        # Initialize known symbols from initial fetch
+        for instrument_type, pairs in self._all_pairs.items():
+            self._known_symbols[instrument_type] = {p.symbol for p in pairs}
+
+        # Start ticker listeners for all supported instrument types
+        supported = self.get_supported_instruments()
+        tasks = [
+            asyncio.create_task(self._listen_ticker_stream(instrument_type))
+            for instrument_type in supported
+        ]
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _listen_ticker_stream(self, instrument_type: InstrumentType) -> None:
+        """
+        Listen to Bitget ticker stream for an instrument type.
+        Detects new symbols and triggers REST refresh when found.
+
+        Args:
+            instrument_type: The instrument type to monitor
+        """
+        endpoint = self.config.get_endpoint(instrument_type, self.is_testnet)
+        if not endpoint or not endpoint.ws_url:
+            logging.warning(
+                f"Bitget {instrument_type.value} WebSocket URL not configured, falling back to polling"
+            )
+            await self._poll_instrument(instrument_type)
+            return
+
+        retry_delay = 1
+        bitget_inst_type = self._get_bitget_inst_type(instrument_type)
+
+        async def send_ping(ws: aiohttp.ClientWebSocketResponse) -> None:
+            """Send periodic pings to keep the connection alive."""
+            while True:
+                try:
+                    await asyncio.sleep(self.config.ping_interval)
+                    await ws.send_str("ping")
+                    self._last_ping_time = time.time()
+                except Exception as e:
+                    logging.error("Error sending Bitget ping: %s", e)
+                    break
+
+        while True:
+            try:
+                await self.ws_rate_limiter.acquire()
+                async with self.session.ws_connect(endpoint.ws_url) as ws:
+                    logging.info(
+                        "Connected to Bitget %s ticker stream at %s",
+                        instrument_type.value,
+                        endpoint.ws_url,
+                    )
+                    retry_delay = 1
+                    self._last_ping_time = time.time()
+
+                    # Subscribe to all tickers for this instrument type
+                    # Omitting instId subscribes to all symbols
+                    subscribe_msg = {
+                        "op": "subscribe",
+                        "args": [{"instType": bitget_inst_type, "channel": "ticker"}],
+                    }
+                    await ws.send_json(subscribe_msg)
+
+                    # Start ping task
+                    ping_task = asyncio.create_task(send_ping(ws))
+
+                    try:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                # Handle pong response (Bitget returns "pong" string)
+                                if msg.data == "pong":
+                                    continue
+
+                                data = msg.json()
+
+                                # Handle subscription confirmation
+                                if data.get("event") == "subscribe":
+                                    logging.info(
+                                        "Subscribed to Bitget %s tickers", instrument_type.value
+                                    )
+                                    continue
+
+                                # Handle error
+                                if data.get("event") == "error":
+                                    logging.error("Bitget WebSocket error: %s", data.get("msg"))
+                                    continue
+
+                                # Handle ticker data
+                                if "data" in data and data.get("arg", {}).get("channel") == "ticker":
+                                    await self._process_bitget_ticker(instrument_type, data)
+
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                logging.error(
+                                    "Bitget %s ticker stream error: %s",
+                                    instrument_type.value,
+                                    ws.exception(),
+                                )
+                                break
+                    finally:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
+
+            except Exception as e:
+                logging.error(
+                    "Bitget %s ticker stream exception: %s", instrument_type.value, e
+                )
+
+            logging.info(
+                "Bitget %s ticker stream disconnected. Reconnecting in %s seconds...",
+                instrument_type.value,
+                retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+
+    async def _process_bitget_ticker(
+        self, instrument_type: InstrumentType, data: Dict[str, Any]
+    ) -> None:
+        """
+        Process Bitget ticker data and detect new symbols.
+
+        Args:
+            instrument_type: The instrument type being processed
+            data: Ticker message from WebSocket
+        """
+        known = self._known_symbols.get(instrument_type, set())
+        new_symbols = set()
+
+        # Bitget ticker data is in data array, each item has instId
+        for ticker in data.get("data", []):
+            symbol = ticker.get("instId")
+            if symbol and symbol not in known:
+                new_symbols.add(symbol)
+
+        if new_symbols:
+            logging.info(
+                "Detected %d new %s symbols on Bitget: %s",
+                len(new_symbols),
+                instrument_type.value,
+                list(new_symbols)[:5],
+            )
+            # Trigger REST refresh to get full instrument details
+            endpoint = self.config.get_endpoint(instrument_type, self.is_testnet)
+            if endpoint:
+                try:
+                    await self._fetch_instrument_data(instrument_type, endpoint.rest_url)
+                    # Update known symbols
+                    if instrument_type in self._all_pairs:
+                        self._known_symbols[instrument_type] = {
+                            p.symbol for p in self._all_pairs[instrument_type]
+                        }
+                    # Emit updated state
+                    if updated_state := self.state.update_state({}, self._to_standard):
+                        self._bus.publish(updated_state)
+                except Exception as e:
+                    logging.error(
+                        f"Failed to refresh {instrument_type.value} after new symbol detection: {e}"
+                    )
+
+    async def _poll_instrument(self, instrument_type: InstrumentType) -> None:
+        """
+        Fallback polling for a single instrument type when WebSocket unavailable.
+
+        Args:
+            instrument_type: The instrument type to poll
+        """
         while True:
             await asyncio.sleep(300)
             try:
-                await self._fetch_initial_snapshot()
+                endpoint = self.config.get_endpoint(instrument_type, self.is_testnet)
+                if endpoint:
+                    await self._fetch_instrument_data(instrument_type, endpoint.rest_url)
+                    if self._all_pairs:
+                        if updated_state := self.state.update_state({}, self._to_standard):
+                            self._bus.publish(updated_state)
             except Exception as e:
-                logging.error(f"Bitget periodic update failed: {e}")
+                logging.error(f"Bitget {instrument_type.value} poll failed: {e}")
